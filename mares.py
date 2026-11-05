@@ -2,9 +2,14 @@
 """
 Relatório Atmosférico, Marítimo, de Marés e Análise de Bodyboard (via Ollama)
 para Vila do Conde, Portugal.
-Utiliza as APIs gratuitas (sem chave) da Open-Meteo (Weather & Marine)
-e o modelo local ministral-3:3b via Ollama.
-Sem dependências externas (apenas biblioteca padrão do Python 3).
+
+Este módulo recolhe dados meteorológicos e oceanográficos através das APIs gratuitas
+(sem necessidade de chave de API) da Open-Meteo (Weather Forecast e Marine),
+calcula os horários e alturas das marés (Preia-mar e Baixa-mar) com interpolação
+parabólica e envia o contexto estruturado dos próximos 3 dias para o modelo local
+`ministral-3:3b` no Ollama, gerando recomendações para a prática de bodyboard.
+
+Não requer dependências externas — utiliza apenas a biblioteca padrão do Python 3.
 """
 
 from __future__ import annotations
@@ -20,29 +25,54 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
-# Coordenadas de Vila do Conde, Portugal
+# ==============================================================================
+# CONFIGURAÇÕES GEOGRÁFICAS E CONSTANTES GLOBAIS
+# ==============================================================================
+
+# Nome da localização apresentada nos cabeçalhos do relatório e no contexto de IA
 LOCATION_NAME = "Vila do Conde, Portugal"
+
+# Coordenadas terrestres de Vila do Conde (usadas na API de meteorologia)
 LATITUDE = 41.3536
 LONGITUDE = -8.7439
-# Ponto costeiro ligeiramente ao largo da foz do Ave / Vila do Conde para a grelha marítima
+
+# Coordenadas costeiras ligeiramente ao largo da foz do Ave / Vila do Conde
+# (usadas na API marítima para garantir que o ponto cai numa célula oceânica da grelha)
 MARINE_LATITUDE = 41.3500
 MARINE_LONGITUDE = -8.7650
+
+# Fuso horário de Portugal Continental para alinhar todas as séries temporais
 TIMEZONE = "Europe/Lisbon"
 
-# Diferença entre o Nível Médio do Mar (MSL) e o Zero Hidrográfico (ZH) na costa norte (Leixões/Vila do Conde)
-# O Nível Médio (NM) situa-se a +2.00 m acima do Zero Hidrográfico (ZH).
+# Diferença entre o Nível Médio do Mar (MSL) e o Zero Hidrográfico (ZH) na costa norte
+# portuguesa (referência Leixões / Vila do Conde). O Nível Médio situa-se a +2.00 m
+# acima do Zero Hidrográfico, pelo que: Altura_ZH = Altura_MSL + 2.00 m.
 ZH_OFFSET_METERS = 2.00
 
+# Endpoints oficiais das APIs REST da Open-Meteo
 WEATHER_API_URL = "https://api.open-meteo.com/v1/forecast"
 MARINE_API_URL = "https://marine-api.open-meteo.com/v1/marine"
 
+# Configuração padrão do servidor local Ollama e do modelo LLM a utilizar
+# Podem ser sobrepostos por variáveis de ambiente (OLLAMA_HOST, OLLAMA_MODEL) ou flags CLI
 DEFAULT_OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "ministral-3:3b")
+
+# Horizonte temporal (em dias) analisado pelo modelo de IA para recomendações de bodyboard
 BODYBOARD_ANALYSIS_DAYS = 3
 
 
+# ==============================================================================
+# FORMATAÇÃO ANSI E TABELAS DE TRADUÇÃO METEOROLÓGICA
+# ==============================================================================
+
+
 class Ansi:
-    """Códigos ANSI básicos para formatação no terminal."""
+    """
+    Gestor de sequências de escape ANSI para colorir e estilizar o texto no terminal.
+    Se `enabled` for False (ex: `--no-color`, variável `NO_COLOR` ou redirecionamento
+    para ficheiro/pipe), todas as propriedades devolvem strings vazias.
+    """
 
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled
@@ -57,6 +87,8 @@ class Ansi:
         self.MAGENTA = "\033[35m" if enabled else ""
 
 
+# Tabela oficial de códigos meteorológicos WMO (World Meteorological Organization)
+# traduzidos para Português de Portugal
 WMO_WEATHER_CODES: dict[int, str] = {
     0: "Céu limpo",
     1: "Geralmente limpo",
@@ -88,6 +120,7 @@ WMO_WEATHER_CODES: dict[int, str] = {
     99: "Trovoada com granizo forte",
 }
 
+# Nomes dos dias da semana em português (índice 0 = Segunda-feira, 6 = Domingo)
 DIAS_SEMANA = [
     "Segunda-feira",
     "Terça-feira",
@@ -99,8 +132,16 @@ DIAS_SEMANA = [
 ]
 
 
+# ==============================================================================
+# FUNÇÕES AUXILIARES DE CONVERSÃO E CLASSIFICAÇÃO
+# ==============================================================================
+
+
 def degrees_to_cardinal(deg: float | None) -> str:
-    """Converte graus azimutais (0-360) em ponto cardeal/colateral em português."""
+    """
+    Converte uma direção azimutal em graus (0° a 360°) para a respetiva rosa dos ventos
+    de 16 pontos cardeais/colaterais/subcolaterais em português (ex: 'ONO (295°)').
+    """
     if deg is None:
         return "N/D"
     directions = [
@@ -109,22 +150,28 @@ def degrees_to_cardinal(deg: float | None) -> str:
         "S", "SSO", "SO", "OSO",
         "O", "ONO", "NO", "NNO",
     ]
+    # Cada setor da rosa de 16 pontas abrange 22.5 graus (360 / 16)
     idx = round(deg / 22.5) % 16
     return f"{directions[idx]} ({deg:.0f}°)"
 
 
 def classify_wind_for_coast(deg: float | None, speed_kmh: float | None) -> str:
     """
-    Classifica o vento para as praias de Vila do Conde (orientadas a Oeste ~270°).
-    - Quadrante Este (35° a 145°): Offshore / Terral (alisado, excelente para tubos)
-    - Vento < 8 km/h: Fraco / Glassy
-    - Quadrante Norte/Sul (335°-35° ou 145°-205°): Side-shore (cruzado)
-    - Quadrante Oeste (205° a 335°): Onshore / Marítimo
+    Classifica o efeito do vento sobre a formação das ondas nas praias de Vila do Conde
+    (cuja linha de costa está orientada aproximadamente para Oeste, ~270°):
+      - Vento < 8 km/h: Fraco / Glassy (superfície do mar lisa independentemente do rumo)
+      - Quadrante Este (35° a 145°): Offshore / Terral (venta da terra para o mar,
+        segura a parede da onda e favorece tubos para o bodyboard)
+      - Quadrante Norte/Sul próximo de Este (15°–35° ou 145°–185°): Side-offshore
+      - Quadrante Norte/Sul cruzado (330°–15° ou 185°–215°): Side-shore / Cruzado
+      - Quadrante Oeste (215° a 330°): Onshore / Marítimo (venta do mar para terra,
+        degrada a formação das ondas)
     """
     if speed_kmh is not None and speed_kmh < 8.0:
         return "Fraco/Glassy (Excelente)"
     if deg is None:
         return "N/D"
+
     d = deg % 360
     if 35 <= d <= 145:
         return "Offshore / Terral (Ideal)"
@@ -136,14 +183,22 @@ def classify_wind_for_coast(deg: float | None, speed_kmh: float | None) -> str:
 
 
 def weather_description(code: int | None) -> str:
-    """Devolve a descrição em português do código meteorológico WMO."""
+    """Traduz um código numérico WMO para a sua descrição meteorológica em português."""
     if code is None:
         return "Desconhecido"
     return WMO_WEATHER_CODES.get(int(code), f"Código WMO {code}")
 
 
+# ==============================================================================
+# CLIENTES DE RECOLHA DE DADOS (OPEN-METEO WEATHER & MARINE)
+# ==============================================================================
+
+
 def fetch_json(base_url: str, params: dict[str, Any], timeout: int = 12) -> dict[str, Any]:
-    """Faz um pedido HTTP GET e devolve o JSON descodificado."""
+    """
+    Constrói um URL com query string, executa um pedido HTTP GET e devolve a
+    resposta JSON convertida num dicionário Python.
+    """
     query = urllib.parse.urlencode(params)
     url = f"{base_url}?{query}"
     req = urllib.request.Request(
@@ -158,7 +213,13 @@ def fetch_json(base_url: str, params: dict[str, Any], timeout: int = 12) -> dict
 
 
 def fetch_weather_data(forecast_days: int = 5) -> dict[str, Any]:
-    """Obtém dados meteorológicos atuais, horários e diários para Vila do Conde."""
+    """
+    Recolhe os dados atmosféricos para Vila do Conde a partir da API Open-Meteo Forecast:
+      - `current`: condições meteorológicas em tempo real
+      - `hourly`: séries horárias de temperatura, precipitação e vento (para análise de IA)
+      - `daily`: agregações diárias (temperaturas mín/máx, sol, vento máx, precipitação)
+    """
+    # Garante pelo menos 3 dias para alimentar a análise de bodyboard
     days_to_fetch = max(forecast_days, BODYBOARD_ANALYSIS_DAYS)
     params = {
         "latitude": LATITUDE,
@@ -204,7 +265,15 @@ def fetch_weather_data(forecast_days: int = 5) -> dict[str, Any]:
 
 
 def fetch_marine_data(forecast_days: int = 5) -> dict[str, Any]:
-    """Obtém dados marítimos e de nível do mar (marés) para Vila do Conde."""
+    """
+    Recolhe os dados oceanográficos e de marés para a costa de Vila do Conde a partir
+    da API Open-Meteo Marine:
+      - `past_days=1`: inclui o dia anterior para permitir interpolar o estado da maré
+        no início do dia atual (saber qual foi a última maré antes do momento atual)
+      - `current`: ondulação total, swell, vaga de vento, temp. da água e nível do mar atual
+      - `hourly`: série horária de `sea_level_height_msl` (para extração das marés) e ondas
+      - `daily`: máximos diários de ondulação, período e direção dominante
+    """
     days_to_fetch = max(forecast_days, BODYBOARD_ANALYSIS_DAYS)
     params = {
         "latitude": MARINE_LATITUDE,
@@ -245,20 +314,33 @@ def fetch_marine_data(forecast_days: int = 5) -> dict[str, Any]:
     return fetch_json(MARINE_API_URL, params)
 
 
+# ==============================================================================
+# CÁLCULO E INTERPOLAÇÃO DAS MARÉS (PREIA-MAR E BAIXA-MAR)
+# ==============================================================================
+
+
 def extract_tides_from_hourly(
     times_iso: list[str],
     levels_msl: list[float | None],
 ) -> list[dict[str, Any]]:
     """
-    Identifica os extremos de maré (Preia-mar e Baixa-mar) a partir de séries horárias
-    de `sea_level_height_msl` usando interpolação parabólica nos 3 pontos em torno de
-    cada extremo para obter o minuto exato e a altura refinada.
+    Deteta todos os extremos de maré (Preia-mar e Baixa-mar) a partir da série horária
+    de altura do nível do mar em relação ao Nível Médio (`sea_level_height_msl`).
+
+    Algoritmo:
+      1. Filtra pares válidos (timestamp, nível MSL).
+      2. Percorre a série procurando máximos e mínimos locais numa vizinhança de ±2 horas
+         (dado que a maré em Portugal é semidiurna, com ~6h12m entre cada extremo).
+      3. Aplica interpolação parabólica (quadrática) nos 3 pontos adjacentes ao extremo
+         (i-1, i, i+1) para estimar o instante exato (ao minuto) e a altura de pico/vale.
+      4. Converte a altura MSL para o Zero Hidrográfico (ZH = MSL + 2.00 m).
     """
     valid_points: list[tuple[datetime, float]] = []
     for t_str, lvl in zip(times_iso, levels_msl):
         if lvl is not None:
             valid_points.append((datetime.fromisoformat(t_str), float(lvl)))
 
+    # São necessários pelo menos 5 pontos para avaliar uma janela de ±2 horas
     if len(valid_points) < 5:
         return []
 
@@ -272,8 +354,7 @@ def extract_tides_from_hourly(
         _, y_prev2 = valid_points[i - 2]
         _, y_next2 = valid_points[i + 2]
 
-        # Verifica se é um máximo local (Preia-mar) ou mínimo local (Baixa-mar)
-        # num intervalo de ±2 horas (ciclo semidiurno tem ~6h12m entre extremos)
+        # Condição de máximo local (Preia-mar) ou mínimo local (Baixa-mar)
         is_max = (
             y_curr >= y_prev
             and y_curr > y_next
@@ -290,9 +371,10 @@ def extract_tides_from_hourly(
         if not (is_max or is_min):
             continue
 
-        # Evita duplicados demasiado próximos (< 4 horas)
+        # Previne falsos extremos a menos de 4 horas do extremo anterior
         if extrema and abs((t_curr - extrema[-1]["raw_time"]).total_seconds()) < 4 * 3600:
             last = extrema[-1]
+            # Se for do mesmo tipo e ainda mais pronunciado, substitui o registo anterior
             if (is_max and last["type"] == "HIGH" and y_curr > last["height_msl"]) or (
                 is_min and last["type"] == "LOW" and y_curr < last["height_msl"]
             ):
@@ -300,10 +382,12 @@ def extract_tides_from_hourly(
             else:
                 continue
 
-        # Interpolação parabólica nos pontos (i-1, i, i+1)
+        # Interpolação parabólica no vértice da parábola que passa por (-1, y_prev), (0, y_curr), (+1, y_next):
+        # delta_hours = (y_prev - y_next) / (2 * (y_prev - 2*y_curr + y_next))
         denom = 2.0 * (y_prev - 2.0 * y_curr + y_next)
         if abs(denom) > 1e-6:
             delta_hours = (y_prev - y_next) / denom
+            # Limita o desvio a ±45 minutos para estabilidade numérica
             delta_hours = max(-0.75, min(0.75, delta_hours))
             y_interp = y_curr - ((y_prev - y_next) ** 2) / (4.0 * denom)
         else:
@@ -330,7 +414,14 @@ def compute_current_tide_state(
     tides: list[dict[str, Any]],
     current_msl: float | None,
 ) -> dict[str, Any] | None:
-    """Determina se a maré está a encher ou a vazar e o progresso entre extremos."""
+    """
+    Calcula o estado da maré num determinado instante `now`:
+      - Identifica a maré imediatamente anterior (`prev_tide`) e a seguinte (`next_tide`).
+      - Determina se a maré está a encher (`A ENCHER ↗`) ou a vazar (`A VAZAR ↘`).
+      - Calcula a fração de progresso temporal (0.0 a 1.0) entre os dois extremos.
+      - Estima a altura atual em relação ao Zero Hidrográfico (usando `current_msl` se
+        disponível ou interpolação cosenoidal suave entre os extremos).
+    """
     if not tides:
         return None
 
@@ -346,6 +437,7 @@ def compute_current_tide_state(
     if next_tide is None:
         return None
 
+    # Se o próximo extremo é uma Preia-mar (HIGH), a maré está a encher
     rising = next_tide["type"] == "HIGH"
     status_str = "A ENCHER ↗" if rising else "A VAZAR ↘"
 
@@ -357,12 +449,14 @@ def compute_current_tide_state(
         elapsed_sec = (now - prev_tide["time"]).total_seconds()
         if total_sec > 0:
             progress = max(0.0, min(1.0, elapsed_sec / total_sec))
+            # Caso não exista medição direta de MSL para este instante, usa curva cosenoidal
             if estimated_zh is None:
                 factor = (1.0 - math.cos(math.pi * progress)) / 2.0
                 estimated_zh = prev_tide["height_zh"] + factor * (
                     next_tide["height_zh"] - prev_tide["height_zh"]
                 )
 
+    # Tempo restante até à próxima Preia-mar ou Baixa-mar
     remaining = next_tide["time"] - now
     rem_total_minutes = max(0, int(remaining.total_seconds() // 60))
     rem_hours, rem_minutes = divmod(rem_total_minutes, 60)
@@ -378,14 +472,25 @@ def compute_current_tide_state(
     }
 
 
+# ==============================================================================
+# INTEGRAÇÃO COM OLLAMA (ministral-3:3b) PARA ANÁLISE DE BODYBOARD
+# ==============================================================================
+
+
 def build_3day_bodyboard_context(
     weather: dict[str, Any],
     marine: dict[str, Any],
     tides: list[dict[str, Any]],
 ) -> str:
     """
-    Constrói um resumo estruturado dos próximos 3 dias (em janelas diurnas de 3h + marés)
-    otimizado para ser analisado pelo modelo ministral-3:3b no Ollama.
+    Constrói um resumo textual estruturado e compacto dos próximos 3 dias,
+    agrupado por janelas diurnas (07h, 10h, 13h, 16h, 18h), combinando:
+      - Horários de luz solar (nascer e pôr do sol)
+      - Tábua de marés do dia
+      - Ondulação total, altura/período/direção do swell
+      - Velocidade, rajadas, direção e classificação costeira do vento (Offshore/Onshore)
+      - Fase e altura da maré em cada janela horária
+      - Temperatura do ar, da água e precipitação
     """
     curr_w = weather.get("current", {})
     curr_m = marine.get("current", {})
@@ -396,7 +501,7 @@ def build_3day_bodyboard_context(
     hourly_m = marine.get("hourly", {})
     daily_w = weather.get("daily", {})
 
-    # Indexar séries horárias por timestamp "YYYY-MM-DDTHH:MM"
+    # Indexa os dados meteorológicos horários por timestamp ISO ("YYYY-MM-DDTHH:MM")
     w_by_time: dict[str, dict[str, Any]] = {}
     for idx, t_str in enumerate(hourly_w.get("time", [])):
         w_by_time[t_str] = {
@@ -408,6 +513,7 @@ def build_3day_bodyboard_context(
             "wind_gst": _safe_idx(hourly_w.get("wind_gusts_10m"), idx),
         }
 
+    # Indexa os dados marítimos horários por timestamp ISO ("YYYY-MM-DDTHH:MM")
     m_by_time: dict[str, dict[str, Any]] = {}
     for idx, t_str in enumerate(hourly_m.get("time", [])):
         msl = _safe_idx(hourly_m.get("sea_level_height_msl"), idx)
@@ -430,6 +536,7 @@ def build_3day_bodyboard_context(
     lines.append(f"Temperatura atual da água do mar: {sst_now} °C")
     lines.append("")
 
+    # Seleciona os próximos 3 dias e as horas diurnas de referência
     d_times = daily_w.get("time", [])[:BODYBOARD_ANALYSIS_DAYS]
     sample_hours = [7, 10, 13, 16, 18]
 
@@ -440,6 +547,7 @@ def build_3day_bodyboard_context(
 
         lines.append(f"=== DIA {i + 1}: {format_date_pt(d_dt)} (Luz solar: {sunrise} às {sunset}) ===")
 
+        # Lista as marés previstas para este dia
         day_tides = [t for t in tides if t["time"].date() == d_dt.date()]
         if day_tides:
             tides_str = " | ".join(
@@ -454,12 +562,13 @@ def build_3day_bodyboard_context(
         for hr in sample_hours:
             slot_key = f"{d_str}T{hr:02d}:00"
             slot_dt = datetime.fromisoformat(slot_key)
-            # Se for no próprio dia e a hora já passou há mais de 2h, indicar como passado
+            # Marca janelas do próprio dia que já tenham decorrido para o LLM não as recomendar
             past_tag = " [JÁ PASSOU]" if slot_dt < (now_dt - timedelta(hours=1)) else ""
 
             w = w_by_time.get(slot_key, {})
             m = m_by_time.get(slot_key, {})
 
+            # Calcula a tendência e altura da maré nesta hora específica
             t_state = compute_current_tide_state(
                 slot_dt,
                 tides,
@@ -503,8 +612,10 @@ def query_ollama_bodyboard(
     timeout: int = 120,
 ) -> str:
     """
-    Envia os dados meteorológicos, de ondulação e marés para o Ollama (`ministral-3:3b`)
-    e devolve (ou faz stream em tempo real) a recomendação para bodyboard.
+    Envia o resumo meteorológico e oceanográfico dos próximos 3 dias para a API
+    `/api/chat` do Ollama local e obtém a análise para a prática de bodyboard.
+
+    Se `stream_to_stdout` for True, imprime os tokens recebidos em tempo real no terminal.
     """
     system_prompt = (
         "És um especialista local em bodyboard e oceanografia em Vila do Conde, Portugal. "
@@ -526,7 +637,7 @@ def query_ollama_bodyboard(
         "vento, fase da maré e o porquê de ser a melhor sessão.\n"
         "- 🥈 ALTERNATIVAS (TOP #2 e #3): Outras boas janelas nos próximos 3 dias.\n"
         "- 📅 RESUMO DIA A DIA: Breve nota para cada um dos 3 dias.\n"
-        "-  wetsuit/equipamento: Recomendação rápida de fato conforme a temperatura da água e do ar."
+        "- 🏄 EQUIPAMENTO: Recomendação rápida de fato (wetsuit) conforme a temperatura da água e do ar."
     )
 
     user_prompt = (
@@ -544,6 +655,7 @@ def query_ollama_bodyboard(
         ],
         "stream": stream_to_stdout,
         "options": {
+            # Temperatura baixa para respostas mais analíticas e fiéis aos dados fornecidos
             "temperature": 0.3,
         },
     }
@@ -558,6 +670,7 @@ def query_ollama_bodyboard(
     collected: list[str] = []
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         if stream_to_stdout:
+            # No modo streaming, o Ollama devolve objetos JSON separados por linha (NDJSON)
             for raw_line in resp:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line:
@@ -573,6 +686,7 @@ def query_ollama_bodyboard(
             sys.stdout.write("\n")
             sys.stdout.flush()
         else:
+            # No modo não-streaming (ex: flag `--json`), lê a resposta única completa
             body = json.loads(resp.read().decode("utf-8"))
             content = body.get("message", {}).get("content", "")
             collected.append(content)
@@ -580,8 +694,16 @@ def query_ollama_bodyboard(
     return "".join(collected).strip()
 
 
+# ==============================================================================
+# APRESENTAÇÃO E RENDERIZAÇÃO NO TERMINAL
+# ==============================================================================
+
+
 def render_progress_bar(progress: float | None, width: int = 20) -> str:
-    """Desenha uma barra de progresso simples em texto."""
+    """
+    Gera uma barra de progresso em caracteres ASCII (ex: '[####----------------] 20%')
+    para representar visualmente a evolução entre a última maré e a próxima.
+    """
     if progress is None:
         return ""
     filled = round(progress * width)
@@ -591,7 +713,7 @@ def render_progress_bar(progress: float | None, width: int = 20) -> str:
 
 
 def format_date_pt(dt_date: datetime) -> str:
-    """Formata uma data em português (ex: Quinta-feira, 05/11/2026)."""
+    """Formata um objeto `datetime` como 'Dia-da-semana, DD/MM/AAAA' em português."""
     weekday = DIAS_SEMANA[dt_date.weekday()]
     return f"{weekday}, {dt_date.strftime('%d/%m/%Y')}"
 
@@ -603,7 +725,13 @@ def print_report(
     forecast_days: int,
     c: Ansi,
 ) -> None:
-    """Imprime o relatório completo no terminal."""
+    """
+    Imprime no terminal as secções [1] a [4] do relatório:
+      [1] Meteorologia Atual
+      [2] Estado do Mar Atual
+      [3] Tábua de Marés (Hoje e Amanhã) + Estado Atual da Maré
+      [4] Previsão Diária para os próximos N dias
+    """
     curr_w = weather.get("current", {})
     curr_m = marine.get("current", {})
 
@@ -613,6 +741,7 @@ def print_report(
     sep_heavy = "=" * 74
     sep_light = "-" * 74
 
+    # Cabeçalho principal
     print(f"{c.BOLD}{c.CYAN}{sep_heavy}{c.RESET}")
     print(
         f"{c.BOLD}  RELATÓRIO ATMOSFÉRICO, MARÍTIMO E DE MARÉS — {LOCATION_NAME.upper()}{c.RESET}"
@@ -623,7 +752,9 @@ def print_report(
     )
     print(f"{c.BOLD}{c.CYAN}{sep_heavy}{c.RESET}\n")
 
-    # 1. CONDIÇÕES ATMOSFÉRICAS ATUAIS
+    # --------------------------------------------------------------------------
+    # [1] CONDIÇÕES ATMOSFÉRICAS ATUAIS
+    # --------------------------------------------------------------------------
     print(f"{c.BOLD}{c.YELLOW}[1] METEOROLOGIA ATUAL{c.RESET}")
     print(sep_light)
     w_desc = weather_description(curr_w.get("weather_code"))
@@ -645,7 +776,9 @@ def print_report(
     print(f"  Precipitação atual : {precip} mm  |   Índice UV atual    : {uv}")
     print()
 
-    # 2. ESTADO DO MAR ATUAL
+    # --------------------------------------------------------------------------
+    # [2] ESTADO DO MAR ATUAL
+    # --------------------------------------------------------------------------
     print(f"{c.BOLD}{c.BLUE}[2] ESTADO DO MAR ATUAL (COSTA DE VILA DO CONDE){c.RESET}")
     print(sep_light)
     wave_h = curr_m.get("wave_height")
@@ -671,7 +804,9 @@ def print_report(
     )
     print()
 
-    # 3. ESTADO ATUAL E PRÓXIMAS MARÉS (HOJE E AMANHÃ)
+    # --------------------------------------------------------------------------
+    # [3] ESTADO ATUAL E PRÓXIMAS MARÉS (HOJE E AMANHÃ)
+    # --------------------------------------------------------------------------
     print(f"{c.BOLD}{c.GREEN}[3] TÁBUA DE MARÉS — HOJE E AMANHÃ{c.RESET}")
     print(sep_light)
 
@@ -737,11 +872,14 @@ def print_report(
         f"Valores modelados por Open-Meteo Marine.{c.RESET}\n"
     )
 
-    # 4. PREVISÃO PARA OS PRÓXIMOS DIAS (METEOROLOGIA + MAR + MARÉS)
+    # --------------------------------------------------------------------------
+    # [4] PREVISÃO PARA OS PRÓXIMOS DIAS (METEOROLOGIA + MAR + MARÉS)
+    # --------------------------------------------------------------------------
     daily_w = weather.get("daily", {})
     daily_m = marine.get("daily", {})
     d_times = daily_w.get("time", [])
 
+    # Associa os resumos diários marítimos por data (já que marine inclui past_days=1)
     marine_by_date: dict[str, dict[str, Any]] = {}
     m_times = daily_m.get("time", [])
     for idx, d_str in enumerate(m_times):
@@ -806,7 +944,10 @@ def print_ai_analysis_section(
     model: str,
     c: Ansi,
 ) -> None:
-    """Imprime a secção [5] com a análise de Bodyboard gerada pelo modelo Ollama."""
+    """
+    Imprime a secção [5] no terminal e solicita ao Ollama (`ministral-3:3b`)
+    a análise das melhores condições para fazer bodyboard nos próximos 3 dias.
+    """
     sep_heavy = "=" * 74
     sep_light = "-" * 74
 
@@ -846,12 +987,19 @@ def print_ai_analysis_section(
 
 
 def _safe_idx(lst: list[Any] | None, idx: int) -> Any:
+    """Devolve o elemento `lst[idx]` de forma segura ou `None` se fora dos limites."""
     if not lst or idx >= len(lst):
         return None
     return lst[idx]
 
 
+# ==============================================================================
+# INTERFACE DE LINHA DE COMANDOS (CLI) E PONTO DE ENTRADA
+# ==============================================================================
+
+
 def parse_args() -> argparse.Namespace:
+    """Configura e processa os argumentos da linha de comandos."""
     parser = argparse.ArgumentParser(
         description=(
             "Relatório atmosférico, marítimo, de marés e recomendação de bodyboard "
@@ -897,7 +1045,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Função principal: coordena a recolha de dados, cálculo de marés, relatório e IA."""
     args = parse_args()
+
+    # Ativa cores ANSI apenas quando o output é um terminal interativo e não foi desativado
     use_color = (
         not args.no_color
         and os.environ.get("NO_COLOR") is None
@@ -905,6 +1056,7 @@ def main() -> int:
     )
     ansi = Ansi(enabled=use_color)
 
+    # 1. Recolha dos dados meteorológicos e marítimos via Open-Meteo
     try:
         weather = fetch_weather_data(forecast_days=args.days)
         marine = fetch_marine_data(forecast_days=args.days)
@@ -918,12 +1070,14 @@ def main() -> int:
         print(f"Erro inesperado ao processar os dados: {exc}", file=sys.stderr)
         return 1
 
+    # 2. Extração e interpolação dos horários de Preia-mar e Baixa-mar
     hourly_m = marine.get("hourly", {})
     tides = extract_tides_from_hourly(
         hourly_m.get("time", []),
         hourly_m.get("sea_level_height_msl", []),
     )
 
+    # 3. Modo de exportação JSON (`--json`)
     if args.json:
         serializable_tides = [
             {
@@ -970,6 +1124,7 @@ def main() -> int:
         )
         return 0
 
+    # 4. Impressão do relatório no terminal e análise de bodyboard via Ollama
     print_report(weather, marine, tides, args.days, ansi)
     if not args.no_ai:
         print_ai_analysis_section(
